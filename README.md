@@ -1,5 +1,7 @@
 # zai-proxy
 
+[![Build and Push Docker Image](https://github.com/CassiopeiaCode/zai-proxy/actions/workflows/docker-build.yml/badge.svg)](https://github.com/CassiopeiaCode/zai-proxy/actions/workflows/docker-build.yml)
+
 zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换为 OpenAI API 兼容格式。用户使用自己的 z.ai token 进行调用。
 
 ## 功能特性
@@ -12,6 +14,7 @@ zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换
 - 支持多模态图片输入
 - **自动生成签名**
 - **自动更新签名版本号**
+- **自动构建 Docker 镜像**（支持 amd64 和 arm64）
 
 ## 快速开始
 
