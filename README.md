@@ -40,7 +40,25 @@ docker run -p 8000:8000 zai-proxy
 
 # 使用环境变量
 docker run -p 8000:8000 -e PORT=8080 -e LOG_LEVEL=debug zai-proxy
+
+# 使用 HTTP 代理
+docker run -p 8000:8000 -e HTTP_PROXY=http://proxy.example.com:8080 zai-proxy
 ```
+
+### Docker Compose 部署
+
+```bash
+# 启动服务
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f
+
+# 停止服务
+docker-compose down
+```
+
+编辑 `docker-compose.yml` 文件以配置环境变量和代理设置。
 
 ## 环境变量
 
@@ -48,6 +66,12 @@ docker run -p 8000:8000 -e PORT=8080 -e LOG_LEVEL=debug zai-proxy
 |--------|------|--------|
 | PORT | 监听端口 | 8000 |
 | LOG_LEVEL | 日志级别 | info |
+| HTTP_PROXY | HTTP代理地址 (可选) | 空 |
+
+HTTP_PROXY 支持的格式示例：
+- `http://proxy.example.com:8080`
+- `http://username:password@proxy.example.com:8080`
+- `https://proxy.example.com:8443`
 
 ## 获取 z.ai Token
 
