@@ -1,5 +1,7 @@
 # zai-proxy
 
+[![Build and Push Docker Image](https://github.com/CassiopeiaCode/zai-proxy/actions/workflows/docker-build.yml/badge.svg)](https://github.com/CassiopeiaCode/zai-proxy/actions/workflows/docker-build.yml)
+
 zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换为 OpenAI API 兼容格式。用户使用自己的 z.ai token 进行调用。
 
 ## 功能特性
@@ -12,6 +14,7 @@ zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换
 - 支持多模态图片输入
 - **自动生成签名**
 - **自动更新签名版本号**
+- **自动构建 Docker 镜像**（支持 amd64 和 arm64）
 
 ## 快速开始
 
@@ -19,7 +22,7 @@ zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换
 
 ```bash
 # 克隆项目
-git clone https://github.com/kao0312/zai-proxy.git
+git clone https://github.com/CassiopeiaCode/zai-proxy.git
 cd zai-proxy
 
 # 安装依赖
@@ -30,6 +33,27 @@ go run main.go
 ```
 
 ### Docker 部署
+
+#### 使用预构建镜像（推荐）
+
+```bash
+# 拉取最新镜像
+docker pull ghcr.io/cassiopeiacode/zai-proxy:latest
+
+# 运行容器
+docker run -p 8000:8000 ghcr.io/cassiopeiacode/zai-proxy:latest
+
+# 使用环境变量
+docker run -p 8000:8000 -e PORT=8080 -e LOG_LEVEL=debug ghcr.io/cassiopeiacode/zai-proxy:latest
+
+# 使用 HTTP 代理
+docker run -p 8000:8000 -e HTTP_PROXY=http://proxy.example.com:8080 ghcr.io/cassiopeiacode/zai-proxy:latest
+
+# 使用特定版本
+docker run -p 8000:8000 ghcr.io/cassiopeiacode/zai-proxy:v1.0.0
+```
+
+#### 手动构建镜像
 
 ```bash
 # 构建镜像
