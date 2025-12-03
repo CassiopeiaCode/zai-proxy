@@ -22,7 +22,7 @@ zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换
 
 ```bash
 # 克隆项目
-git clone https://github.com/kao0312/zai-proxy.git
+git clone https://github.com/CassiopeiaCode/zai-proxy.git
 cd zai-proxy
 
 # 安装依赖
