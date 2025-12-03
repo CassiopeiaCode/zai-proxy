@@ -7,12 +7,33 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/corpix/uarand"
 	"github.com/google/uuid"
 )
+
+// getHTTPClient returns an HTTP client configured with proxy if HTTP_PROXY is set
+func getHTTPClient() *http.Client {
+	client := &http.Client{}
+	
+	if Cfg.HTTPProxy != "" {
+		proxyURL, err := url.Parse(Cfg.HTTPProxy)
+		if err != nil {
+			LogError("Failed to parse HTTP_PROXY: %v", err)
+		} else {
+			transport := &http.Transport{
+				Proxy: http.ProxyURL(proxyURL),
+			}
+			client.Transport = transport
+			LogDebug("Using HTTP proxy: %s", Cfg.HTTPProxy)
+		}
+	}
+	
+	return client
+}
 
 func extractLatestUserContent(messages []Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -137,7 +158,7 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 	// LogDebug("[Request] URL: %s", url)
 	// LogDebug("[Request] Headers: %v", req.Header)
 
-	client := &http.Client{}
+	client := getHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", err

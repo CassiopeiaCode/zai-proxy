@@ -1,0 +1,15 @@
+services:
+  zai-proxy:
+    build: .
+    container_name: zai-proxy
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - LOG_LEVEL=info
+      # 可选：设置 HTTP 代理
+      # - HTTP_PROXY=http://proxy.example.com:8080
+    restart: unless-stopped
+    # 可选：挂载配置文件
+    # volumes:
+    #   - ./.env:/app/.env:ro

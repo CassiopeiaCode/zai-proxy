@@ -1,3 +1,5 @@
 .env
 *.exe
 *.cmd
+zai-proxy
+/tmp/

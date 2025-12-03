@@ -2,7 +2,6 @@ package internal
 
 import (
 	"io"
-	"net/http"
 	"regexp"
 	"sync"
 	"time"
@@ -20,7 +19,8 @@ func GetFeVersion() string {
 }
 
 func fetchFeVersion() {
-	resp, err := http.Get("https://chat.z.ai/")
+	client := getHTTPClient()
+	resp, err := client.Get("https://chat.z.ai/")
 	if err != nil {
 		LogError("Failed to fetch fe version: %v", err)
 		return

@@ -7,7 +7,8 @@ import (
 )
 
 type Config struct {
-	Port string
+	Port      string
+	HTTPProxy string
 }
 
 var Cfg *Config
@@ -20,7 +21,10 @@ func LoadConfig() {
 		port = "8000"
 	}
 
+	httpProxy := os.Getenv("HTTP_PROXY")
+
 	Cfg = &Config{
-		Port: port,
+		Port:      port,
+		HTTPProxy: httpProxy,
 	}
 }
