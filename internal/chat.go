@@ -28,7 +28,13 @@ func getHTTPClient() *http.Client {
 				Proxy: http.ProxyURL(proxyURL),
 			}
 			client.Transport = transport
-			LogDebug("Using HTTP proxy: %s", Cfg.HTTPProxy)
+			// Mask credentials in log message
+			maskedURL := proxyURL.Scheme + "://"
+			if proxyURL.User != nil {
+				maskedURL += "***:***@"
+			}
+			maskedURL += proxyURL.Host
+			LogDebug("Using HTTP proxy: %s", maskedURL)
 		}
 	}
 	

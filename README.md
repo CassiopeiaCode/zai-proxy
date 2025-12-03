@@ -71,7 +71,7 @@ docker-compose down
 HTTP_PROXY 支持的格式示例：
 - `http://proxy.example.com:8080`
 - `http://username:password@proxy.example.com:8080`
-- `socks5://proxy.example.com:1080`
+- `https://proxy.example.com:8443`
 
 ## 获取 z.ai Token
 
