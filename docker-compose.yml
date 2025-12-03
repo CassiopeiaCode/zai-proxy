@@ -1,6 +1,9 @@
 services:
   zai-proxy:
-    build: .
+    # 使用预构建镜像（推荐）
+    image: ghcr.io/cassiopeiacode/zai-proxy:latest
+    # 或者从源码构建
+    # build: .
     container_name: zai-proxy
     ports:
       - "8000:8000"

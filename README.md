@@ -31,6 +31,27 @@ go run main.go
 
 ### Docker 部署
 
+#### 使用预构建镜像（推荐）
+
+```bash
+# 拉取最新镜像
+docker pull ghcr.io/cassiopeiacode/zai-proxy:latest
+
+# 运行容器
+docker run -p 8000:8000 ghcr.io/cassiopeiacode/zai-proxy:latest
+
+# 使用环境变量
+docker run -p 8000:8000 -e PORT=8080 -e LOG_LEVEL=debug ghcr.io/cassiopeiacode/zai-proxy:latest
+
+# 使用 HTTP 代理
+docker run -p 8000:8000 -e HTTP_PROXY=http://proxy.example.com:8080 ghcr.io/cassiopeiacode/zai-proxy:latest
+
+# 使用特定版本
+docker run -p 8000:8000 ghcr.io/cassiopeiacode/zai-proxy:v1.0.0
+```
+
+#### 手动构建镜像
+
 ```bash
 # 构建镜像
 docker build -t zai-proxy .
