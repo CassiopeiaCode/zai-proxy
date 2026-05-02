@@ -14,6 +14,7 @@ var BaseModelMapping = map[string]string{
 	"GLM-4.5-V":    "glm-4.5v",
 	"GLM-4.5-Air":  "0727-106B-API",
 	"0808-360B-DR": "0808-360B-DR",
+	"GLM-5.1":      "glm-5.1",
 }
 
 // v1/models 返回的模型列表（不包含所有标签组合）
@@ -25,6 +26,7 @@ var ModelList = []string{
 	"GLM-4.5-V",
 	"GLM-4.5-Air",
 	"0808-360B-DR",
+	"GLM-5.1",
 }
 
 // 解析模型名称，提取基础模型名和标签
