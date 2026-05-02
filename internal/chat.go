@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -59,6 +60,74 @@ func extractAllImageURLs(messages []Message) []string {
 		allImageURLs = append(allImageURLs, imageURLs...)
 	}
 	return allImageURLs
+}
+
+// injectToolPrompt 将 tools 注入到消息列表中作为系统提示
+func injectToolPrompt(messages []map[string]string, tools []Tool, toolChoice interface{}) []map[string]string {
+	if len(tools) == 0 {
+		return messages
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# Tools\n\n")
+	sb.WriteString("You have access to the following functions. To call a function, output a JSON block wrapped in `<function_call>` tags:\n\n")
+	sb.WriteString("```\n")
+	sb.WriteString("<function_call>\n")
+	sb.WriteString("{\"name\": \"function_name\", \"arguments\": {\"param\": \"value\"}}\n")
+	sb.WriteString("</function_call>\n")
+	sb.WriteString("```\n\n")
+
+	for _, t := range tools {
+		fn := t.Function
+		sb.WriteString(fmt.Sprintf("## %s\n\n", fn.Name))
+		if fn.Description != "" {
+			sb.WriteString(fmt.Sprintf("%s\n\n", fn.Description))
+		}
+		if fn.Parameters != nil {
+			paramsJSON, err := json.Marshal(fn.Parameters)
+			if err == nil {
+				sb.WriteString(fmt.Sprintf("Parameters: `%s`\n\n", string(paramsJSON)))
+			}
+		}
+	}
+
+	// 检查 tool_choice 是否强制调用
+	if tc, ok := toolChoice.(string); ok && tc == "required" {
+		sb.WriteString("IMPORTANT: You MUST call one of the available functions. Do not respond with regular text.\n")
+	}
+	if tc, ok := toolChoice.(map[string]interface{}); ok {
+		if fnObj, ok := tc["function"]; ok {
+			if fnMap, ok := fnObj.(map[string]interface{}); ok {
+				if name, ok := fnMap["name"].(string); ok {
+					sb.WriteString(fmt.Sprintf("IMPORTANT: You MUST call the function '%s'. Do not respond with regular text.\n", name))
+				}
+			}
+		}
+	}
+
+	systemMsg := map[string]string{
+		"role":    "system",
+		"content": sb.String(),
+	}
+
+	// 插入到最前面（如果有现有 system 消息则合并）
+	if len(messages) > 0 && messages[0]["role"] == "system" {
+		messages[0]["content"] = systemMsg["content"] + "\n\n" + messages[0]["content"]
+	} else {
+		messages = append([]map[string]string{systemMsg}, messages...)
+	}
+
+	return messages
+}
+
+// extractLatestUpstreamContent 提取最新用户消息内容（上游格式）
+func extractLatestUpstreamContent(messages []map[string]string) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i]["role"] == "user" {
+			return messages[i]["content"]
+		}
+	}
+	return ""
 }
 
 func makeUpstreamRequest(token string, messages []Message, model string, tools []Tool, toolChoice interface{}) (*http.Response, string, error) {
@@ -115,12 +184,13 @@ func makeUpstreamRequest(token string, messages []Message, model string, tools [
 		"id":      uuid.New().String(),
 	}
 
-	// 传递工具定义
+	// 将 tools 注入到系统提示词中（不通过 API 参数传递）
 	if len(tools) > 0 {
-		body["tools"] = tools
-	}
-	if toolChoice != nil {
-		body["tool_choice"] = toolChoice
+		upstreamMessages = injectToolPrompt(upstreamMessages, tools, toolChoice)
+		// 重新签名（内容已变）
+		latestUserContent = extractLatestUpstreamContent(upstreamMessages)
+		signature = GenerateSignature(userID, requestID, latestUserContent, timestamp)
+		body["signature_prompt"] = latestUserContent
 	}
 
 	// 处理图片上传
@@ -293,6 +363,42 @@ func (t *toolCallTracker) toDelta() ToolCall {
 
 func isJSONStart(s string) bool {
 	return len(s) > 0 && (s[0] == '{' || s[0] == '[')
+}
+
+// parseFunctionCallsFromText 从文本中提取 <function_call> 块
+func parseFunctionCallsFromText(text string) []ToolCall {
+	var calls []ToolCall
+	startTag := "<function_call>"
+	endTag := "</function_call>"
+
+	for {
+		start := strings.Index(text, startTag)
+		if start == -1 {
+			break
+		}
+		end := strings.Index(text, endTag)
+		if end == -1 {
+			break
+		}
+		jsonStr := strings.TrimSpace(text[start+len(startTag) : end])
+		text = text[end+len(endTag):]
+
+		var parsed struct {
+			Name      string      `json:"name"`
+			Arguments interface{} `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+			continue
+		}
+		argsJSON, _ := json.Marshal(parsed.Arguments)
+		calls = append(calls, ToolCall{
+			Index:    len(calls),
+			ID:       fmt.Sprintf("call_%s", uuid.New().String()[:12]),
+			Type:     "function",
+			Function: FunctionCall{Name: parsed.Name, Arguments: string(argsJSON)},
+		})
+	}
+	return calls
 }
 
 func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -779,7 +885,18 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 	fullReasoning := strings.Join(reasoningChunks, "")
 	fullReasoning = searchRefFilter.Process(fullReasoning) + searchRefFilter.Flush()
 
-	if fullContent == "" && len(toolCallTrackers) == 0 {
+	// 从文本中提取函数调用
+	var textToolCalls []ToolCall
+	if fullContent != "" {
+		textToolCalls = parseFunctionCallsFromText(fullContent)
+		if len(textToolCalls) > 0 {
+			// 移除 function_call 标签，保留纯净内容
+			re := regexp.MustCompile(`<function_call>[\s\S]*?</function_call>`)
+			fullContent = strings.TrimSpace(re.ReplaceAllString(fullContent, ""))
+		}
+	}
+
+	if fullContent == "" && len(toolCallTrackers) == 0 && len(textToolCalls) == 0 {
 		LogError("Non-stream response 200 but no content received")
 	}
 
@@ -790,6 +907,9 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 		for _, t := range toolCallTrackers {
 			toolCalls = append(toolCalls, t.toToolCall())
 		}
+	} else if len(textToolCalls) > 0 {
+		finishReason = "tool_calls"
+		toolCalls = textToolCalls
 	}
 
 	response := ChatCompletionResponse{
