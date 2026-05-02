@@ -372,12 +372,21 @@ type dsmlStreamFilter struct {
 func (f *dsmlStreamFilter) Process(chunk string) (text string, calls []ToolCall) {
 	f.buffer += chunk
 
-	// 快速路径：无工具调用语法则全量输出
+	// 快速路径：无工具调用语法且末尾无部分标签则全量输出
 	hasDSML, hasCanonical := ContainsToolCallWrapperSyntaxOutsideIgnored(f.buffer)
 	if !hasDSML && !hasCanonical {
-		result := f.buffer
-		f.buffer = ""
-		return result, nil
+		// 末尾可能是部分工具标签（如 <|D, <tool_c 等）→ 保留等后续
+		safe := safeTextBeforePartialToolTag(f.buffer)
+		if safe == f.buffer {
+			f.buffer = ""
+			return safe, nil
+		}
+		// 有部分标签在末尾，保留在 buffer 中
+		if safe != "" {
+			f.buffer = f.buffer[len(safe):]
+			return safe, nil
+		}
+		return "", nil
 	}
 
 	// 检查是否有完整的 </tool_calls> 闭合标签
@@ -447,20 +456,31 @@ func isPartialToolTagStart(s string) bool {
 	}
 	lower := strings.ToLower(s)
 
-	// Check DSML-prefixed forms: <|dsml|tool_calls, <|dsml|invoke, <|dsml|parameter, </|dsml|...
-	if strings.HasPrefix(lower, "<|dsml|") {
-		return true
+	// All possible complete tool tag openers — if the tail is a prefix of any of
+	// these, we must buffer it because the rest may arrive in a later chunk.
+	fullForms := []string{
+		"<|dsml|tool_calls>",
+		"<|dsml|invoke",
+		"<|dsml|parameter",
+		"</|dsml|tool_calls>",
+		"</|dsml|invoke>",
+		"</|dsml|parameter>",
+		"<tool_calls>",
+		"<invoke",
+		"<parameter",
+		"</tool_calls>",
+		"</invoke>",
+		"</parameter>",
 	}
-	// Check plain XML tool tags: <tool_calls, <invoke, <parameter, </tool_calls, etc.
-	for _, tag := range []string{"<tool_calls", "</tool_calls", "<invoke", "</invoke", "<parameter", "</parameter"} {
-		if strings.HasPrefix(lower, tag) {
+	for _, form := range fullForms {
+		if strings.HasPrefix(form, lower) {
 			return true
 		}
 	}
-	// Check partial prefixes (e.g., <t, <to, <too, <tool)
-	toolCallTag := "<tool_calls"
-	for i := 1; i < len(toolCallTag) && i <= len(lower); i++ {
-		if lower == toolCallTag[:i] {
+	// Also check if lower is a full prefix of one of the forms (tail longer
+	// than form but still possible, e.g. <|dsml|tool_calls>\n)
+	for _, form := range fullForms {
+		if strings.HasPrefix(lower, form) {
 			return true
 		}
 	}
