@@ -109,11 +109,13 @@ func injectToolPrompt(messages []map[string]string, tools []Tool, toolChoice int
 		}
 	}
 
-	// Inject as system message (DS2Api style: promptcompat/tool_prompt.go)
+	// z.ai GLM models ignore system role, so inject tool prompt as a user message
 	if len(messages) > 0 && messages[0]["role"] == "system" {
-		messages[0]["content"] = messages[0]["content"] + "\n\n" + sb.String()
+		sysContent := messages[0]["content"]
+		messages = messages[1:]
+		messages = append([]map[string]string{{"role": "user", "content": sysContent + "\n\n" + sb.String()}}, messages...)
 	} else {
-		messages = append([]map[string]string{{"role": "system", "content": sb.String()}}, messages...)
+		messages = append([]map[string]string{{"role": "user", "content": sb.String()}}, messages...)
 	}
 
 	return messages
