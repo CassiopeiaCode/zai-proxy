@@ -462,9 +462,62 @@ func findFirstToolTagPosition(s string) int {
 }
 
 func (f *dsmlStreamFilter) Flush() string {
-	result := f.buffer
+	return f.buffer
+}
+
+func (f *dsmlStreamFilter) FlushToolCalls() (text string, calls []ToolCall) {
+	buf := f.buffer
 	f.buffer = ""
-	return result
+	if buf == "" {
+		return "", nil
+	}
+
+	// Try parsing as-is first
+	parsed := ParseToolCalls(buf)
+	if len(parsed) > 0 {
+		re := regexp.MustCompile(`<\|?DSML\|?tool_calls[\s\S]*?</\|?DSML\|?tool_calls>`)
+		cleaned := re.ReplaceAllString(buf, "")
+		if cleaned == buf {
+			re2 := regexp.MustCompile(`<tool_calls[\s\S]*?</tool_calls>`)
+			cleaned = re2.ReplaceAllString(buf, "")
+		}
+		for i, pc := range parsed {
+			calls = append(calls, parsedToToolCall(pc, i))
+		}
+		return strings.TrimSpace(cleaned), calls
+	}
+
+	// Try with CDATA recovery (loose CDATA sections)
+	if sanitized := SanitizeLooseCDATA(buf); sanitized != buf {
+		parsed = ParseToolCalls(sanitized)
+		if len(parsed) > 0 {
+			for i, pc := range parsed {
+				calls = append(calls, parsedToToolCall(pc, i))
+			}
+			return "", calls
+		}
+	}
+
+	// Try appending missing closing tag
+	if strings.Contains(strings.ToLower(buf), "<|dsml|tool_calls") || strings.Contains(strings.ToLower(buf), "<tool_calls") {
+		tryWithClose := buf + "\n</|DSML|tool_calls>"
+		parsed = ParseToolCalls(tryWithClose)
+		if len(parsed) > 0 {
+			// Remove the parsed block including the artificial close
+			re := regexp.MustCompile(`<\|?DSML\|?tool_calls[\s\S]*?</\|?DSML\|?tool_calls>`)
+			cleaned := re.ReplaceAllString(tryWithClose, "")
+			if cleaned == tryWithClose {
+				re2 := regexp.MustCompile(`<tool_calls[\s\S]*?</tool_calls>`)
+				cleaned = re2.ReplaceAllString(tryWithClose, "")
+			}
+			for i, pc := range parsed {
+				calls = append(calls, parsedToToolCall(pc, i))
+			}
+			return strings.TrimSpace(cleaned), calls
+		}
+	}
+
+	return buf, nil
 }
 
 func safeTextBeforePartialToolTag(s string) string {
@@ -841,10 +894,29 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		LogError("[Upstream] scanner error: %v", err)
 	}
 
-	// Flush function call filter
-	if remaining := dsmlFilter.Flush(); remaining != "" {
-		remaining = searchRefFilter.Process(remaining) + searchRefFilter.Flush()
-		if remaining != "" {
+	// Flush DSML tool call filter — try to recover incomplete blocks
+	flushText, flushCalls := dsmlFilter.FlushToolCalls()
+	for _, tc := range flushCalls {
+		hasContent = true
+		chunk := ChatCompletionChunk{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   modelName,
+			Choices: []Choice{{
+				Index:        0,
+				Delta:        Delta{ToolCalls: []ToolCall{tc}},
+				FinishReason: nil,
+			}},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	textToolCalls = append(textToolCalls, flushCalls...)
+	if flushText != "" {
+		flushText = searchRefFilter.Process(flushText) + searchRefFilter.Flush()
+		if flushText != "" {
 			hasContent = true
 			chunk := ChatCompletionChunk{
 				ID:      completionID,
@@ -853,7 +925,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 				Model:   modelName,
 				Choices: []Choice{{
 					Index:        0,
-					Delta:        Delta{Content: remaining},
+					Delta:        Delta{Content: flushText},
 					FinishReason: nil,
 				}},
 			}
