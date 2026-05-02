@@ -154,6 +154,7 @@ func makeUpstreamRequest(token string, messages []Message, model string, tools [
 	}
 
 	bodyBytes, _ := json.Marshal(body)
+	LogDebug("[UpstreamBody] %s", string(bodyBytes))
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
