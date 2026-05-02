@@ -372,33 +372,32 @@ type dsmlStreamFilter struct {
 func (f *dsmlStreamFilter) Process(chunk string) (text string, calls []ToolCall) {
 	f.buffer += chunk
 
-	// 快速路径：无工具调用语法且末尾无部分标签则全量输出
-	hasDSML, hasCanonical := ContainsToolCallWrapperSyntaxOutsideIgnored(f.buffer)
-	if !hasDSML && !hasCanonical {
-		// 末尾可能是部分工具标签（如 <|D, <tool_c 等）→ 保留等后续
+	// Find the first tool-related tag that would indicate a tool call block.
+	// Everything before it is safe text; everything from that tag onward is buffered.
+	toolBlockStart := findFirstToolTagPosition(f.buffer)
+	if toolBlockStart < 0 {
+		// No tool tag at all — maybe a partial tag at the very end?
 		safe := safeTextBeforePartialToolTag(f.buffer)
 		if safe == f.buffer {
 			f.buffer = ""
 			return safe, nil
 		}
-		// 有部分标签在末尾，保留在 buffer 中
-		if safe != "" {
-			f.buffer = f.buffer[len(safe):]
-			return safe, nil
-		}
-		return "", nil
+		f.buffer = f.buffer[len(safe):]
+		return safe, nil
 	}
 
-	// 检查是否有完整的 </tool_calls> 闭合标签
+	// There IS a tool tag. Return text before it as safe, keep the rest buffered.
+	if toolBlockStart > 0 {
+		safe := f.buffer[:toolBlockStart]
+		f.buffer = f.buffer[toolBlockStart:]
+		return safe, nil
+	}
+
+	// Tool tag at position 0 — entire buffer is tool block.
+	// Check if the tool block is complete.
 	lower := strings.ToLower(f.buffer)
 	closeIdx := strings.LastIndex(lower, "</tool_calls>")
 	if closeIdx < 0 {
-		// 没有闭合标签，尝试输出安全部分
-		safe := safeTextBeforePartialToolTag(f.buffer)
-		if safe != "" {
-			f.buffer = f.buffer[len(safe):]
-			return safe, nil
-		}
 		return "", nil
 	}
 
@@ -428,6 +427,38 @@ func (f *dsmlStreamFilter) Process(chunk string) (text string, calls []ToolCall)
 	// 解析失败，可能是误识别
 	f.buffer = ""
 	return block + suffix, nil
+}
+
+func findFirstToolTagPosition(s string) int {
+	for i := 0; i < len(s); {
+		if s[i] != '<' {
+			i++
+			continue
+		}
+		// Check if this < starts a DSML or XML tool tag
+		tagStart := i
+		for tagStart > 0 && s[tagStart-1] == '<' {
+			tagStart--
+		}
+		lower := strings.ToLower(s[tagStart:])
+		// Check for DSML-prefixed tags: <|dsml|tool_calls, <|dsml|invoke, <|dsml|parameter, </|dsml|...
+		if strings.HasPrefix(lower, "<|dsml|") {
+			return tagStart
+		}
+		// Check for plain XML tool tags
+		for _, prefix := range []string{"<tool_calls", "</tool_calls", "<invoke", "</invoke", "<parameter", "</parameter"} {
+			if strings.HasPrefix(lower, prefix) {
+				return tagStart
+			}
+		}
+		// Check for partial DSML start (e.g., <|, <|D, <|DS, etc.) that could
+		// become <|dsml|tool_calls>
+		if isPartialToolTagStart(lower) {
+			return tagStart
+		}
+		i++
+	}
+	return -1
 }
 
 func (f *dsmlStreamFilter) Flush() string {
