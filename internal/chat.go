@@ -69,49 +69,51 @@ func injectToolPrompt(messages []map[string]string, tools []Tool, toolChoice int
 	}
 
 	var sb strings.Builder
-	sb.WriteString("你只能通过调用函数来回答。你必须输出一个 JSON 代码块，格式如下：\n\n")
-	sb.WriteString("<function_call>\n")
-	sb.WriteString("{\"name\": \"函数名\", \"arguments\": {\"参数名\": \"参数值\"}}\n")
-	sb.WriteString("</function_call>\n\n")
-	sb.WriteString("严格遵循以下规则：\n")
-	sb.WriteString("1. 不要输出任何解释、问候语或额外文字\n")
-	sb.WriteString("2. 不要用 markdown 代码块包裹 <function_call>\n")
-	sb.WriteString("3. 只能输出一个 <function_call> 块\n\n")
-	sb.WriteString("可用的函数：\n\n")
+	sb.WriteString("You have access to these tools:\n\n")
 
+	names := make([]string, 0, len(tools))
 	for _, t := range tools {
 		fn := t.Function
-		sb.WriteString(fmt.Sprintf("### %s\n", fn.Name))
-		if fn.Description != "" {
-			sb.WriteString(fmt.Sprintf("描述: %s\n", fn.Description))
+		name := strings.TrimSpace(fn.Name)
+		if name == "" {
+			continue
 		}
+		names = append(names, name)
+		desc := fn.Description
+		if desc == "" {
+			desc = "No description available"
+		}
+		sb.WriteString(fmt.Sprintf("Tool: %s\nDescription: %s\n", name, desc))
 		if fn.Parameters != nil {
 			paramsJSON, err := json.Marshal(fn.Parameters)
 			if err == nil {
-				sb.WriteString(fmt.Sprintf("参数: %s\n", string(paramsJSON)))
+				sb.WriteString(fmt.Sprintf("Parameters: %s\n", string(paramsJSON)))
 			}
 		}
 		sb.WriteString("\n")
 	}
 
-	// 检查 tool_choice 是否强制调用
-	if tc, ok := toolChoice.(string); ok && tc == "required" {
-		sb.WriteString("【重要】你必须调用上述函数之一，禁止输出普通文本回复。\n")
+	sb.WriteString(BuildToolCallInstructions(names))
+
+	// tool_choice handling (DS2Api style)
+	if tc, ok := toolChoice.(string); ok && strings.ToLower(tc) == "required" {
+		sb.WriteString("\nIMPORTANT: For this response, you MUST call at least one tool from the allowed list.\n")
 	}
 	if tc, ok := toolChoice.(map[string]interface{}); ok {
 		if fnObj, ok := tc["function"]; ok {
 			if fnMap, ok := fnObj.(map[string]interface{}); ok {
 				if name, ok := fnMap["name"].(string); ok {
-					sb.WriteString(fmt.Sprintf("【重要】你必须调用函数 '%s'，禁止调用其他函数或输出文本。\n", name))
+					sb.WriteString(fmt.Sprintf("\nIMPORTANT: You MUST call exactly this tool: %s. Do not call any other tool.\n", name))
 				}
 			}
 		}
 	}
 
-	// 拼接到最后一条用户消息末尾（比 system 消息对 GLM 更有效）
-	if len(messages) > 0 {
-		lastIdx := len(messages) - 1
-		messages[lastIdx]["content"] = messages[lastIdx]["content"] + "\n\n" + sb.String()
+	// Inject as system message (DS2Api style: promptcompat/tool_prompt.go)
+	if len(messages) > 0 && messages[0]["role"] == "system" {
+		messages[0]["content"] = messages[0]["content"] + "\n\n" + sb.String()
+	} else {
+		messages = append([]map[string]string{{"role": "system", "content": sb.String()}}, messages...)
 	}
 
 	return messages
@@ -360,114 +362,104 @@ func isJSONStart(s string) bool {
 	return len(s) > 0 && (s[0] == '{' || s[0] == '[')
 }
 
-// functionCallStreamFilter 流式检测 <function_call> JSON 块
-type functionCallStreamFilter struct {
+// dsmlStreamFilter 流式检测 DSML/XML 工具调用块（参考 DS2Api toolstream）
+type dsmlStreamFilter struct {
 	buffer string
-	inCall bool
 }
 
-func (f *functionCallStreamFilter) Process(chunk string) (text string, calls []ToolCall) {
+func (f *dsmlStreamFilter) Process(chunk string) (text string, calls []ToolCall) {
 	f.buffer += chunk
 
-	startTag := "<function_call>"
-	endTag := "</function_call>"
-
-	var textParts []string
-	remaining := f.buffer
-
-	for {
-		if !f.inCall {
-			idx := strings.Index(remaining, startTag)
-			if idx == -1 {
-				safe, hold := splitSafeForPartialTag(remaining, startTag)
-				textParts = append(textParts, safe)
-				remaining = hold
-				break
-			}
-			textParts = append(textParts, remaining[:idx])
-			remaining = remaining[idx+len(startTag):]
-			f.inCall = true
-		}
-
-		if f.inCall {
-			idx := strings.Index(remaining, endTag)
-			if idx == -1 {
-				break
-			}
-			jsonStr := strings.TrimSpace(remaining[:idx])
-			remaining = remaining[idx+len(endTag):]
-			f.inCall = false
-
-			var parsed struct {
-				Name      string      `json:"name"`
-				Arguments interface{} `json:"arguments"`
-			}
-			if err := json.Unmarshal([]byte(jsonStr), &parsed); err == nil {
-				argsJSON, _ := json.Marshal(parsed.Arguments)
-				calls = append(calls, ToolCall{
-					Index:    len(calls),
-					ID:       fmt.Sprintf("call_%s", uuid.New().String()[:12]),
-					Type:     "function",
-					Function: FunctionCall{Name: parsed.Name, Arguments: string(argsJSON)},
-				})
-			}
-		}
+	// 快速路径：无工具调用语法则全量输出
+	hasDSML, hasCanonical := ContainsToolCallWrapperSyntaxOutsideIgnored(f.buffer)
+	if !hasDSML && !hasCanonical {
+		result := f.buffer
+		f.buffer = ""
+		return result, nil
 	}
 
-	f.buffer = remaining
-	return strings.Join(textParts, ""), calls
+	// 检查是否有完整的 </tool_calls> 闭合标签
+	lower := strings.ToLower(f.buffer)
+	closeIdx := strings.LastIndex(lower, "</tool_calls>")
+	if closeIdx < 0 {
+		// 没有闭合标签，尝试输出安全部分
+		safe := safeTextBeforePartialToolTag(f.buffer)
+		if safe != "" {
+			f.buffer = f.buffer[len(safe):]
+			return safe, nil
+		}
+		return "", nil
+	}
+
+	// 有完整闭合标签，尝试解析
+	afterClose := closeIdx + len("</tool_calls>")
+	block := f.buffer[:afterClose]
+	suffix := f.buffer[afterClose:]
+
+	parsed := ParseToolCalls(block)
+	if len(parsed) > 0 {
+		// 移除工具调用文本，输出剩余文本
+		re := regexp.MustCompile(`<\|?DSML\|?tool_calls[\s\S]*?</\|?DSML\|?tool_calls>`)
+		cleaned := re.ReplaceAllString(block, "")
+		// Fallback: 用标准 XML 标签再清理一次
+		if cleaned == block {
+			re2 := regexp.MustCompile(`<tool_calls[\s\S]*?</tool_calls>`)
+			cleaned = re2.ReplaceAllString(block, "")
+		}
+		text = strings.TrimSpace(cleaned)
+		for i, pc := range parsed {
+			calls = append(calls, parsedToToolCall(pc, i))
+		}
+		f.buffer = suffix
+		return text, calls
+	}
+
+	// 解析失败，可能是误识别
+	f.buffer = ""
+	return block + suffix, nil
 }
 
-func (f *functionCallStreamFilter) Flush() string {
+func (f *dsmlStreamFilter) Flush() string {
 	result := f.buffer
 	f.buffer = ""
-	f.inCall = false
 	return result
 }
 
-func splitSafeForPartialTag(s, tag string) (safe, hold string) {
-	for i := 1; i < len(tag) && i <= len(s); i++ {
-		if strings.HasSuffix(s, tag[:i]) {
-			return s[:len(s)-i], s[len(s)-i:]
-		}
+func safeTextBeforePartialToolTag(s string) string {
+	// 查找最后一个 '<' 并检查是否是部分工具标签
+	lastLT := strings.LastIndex(s, "<")
+	if lastLT < 0 {
+		return s
 	}
-	return s, ""
+	// 检查是否有不完整的 tool_calls 或 DSML 前缀
+	tail := s[lastLT:]
+	if isPartialToolTagStart(tail) {
+		return s[:lastLT]
+	}
+	return s
 }
 
-// parseFunctionCallsFromText 从文本中提取 <function_call> 块
-func parseFunctionCallsFromText(text string) []ToolCall {
-	var calls []ToolCall
-	startTag := "<function_call>"
-	endTag := "</function_call>"
-
-	for {
-		start := strings.Index(text, startTag)
-		if start == -1 {
-			break
-		}
-		end := strings.Index(text, endTag)
-		if end == -1 {
-			break
-		}
-		jsonStr := strings.TrimSpace(text[start+len(startTag) : end])
-		text = text[end+len(endTag):]
-
-		var parsed struct {
-			Name      string      `json:"name"`
-			Arguments interface{} `json:"arguments"`
-		}
-		if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-			continue
-		}
-		argsJSON, _ := json.Marshal(parsed.Arguments)
-		calls = append(calls, ToolCall{
-			Index:    len(calls),
-			ID:       fmt.Sprintf("call_%s", uuid.New().String()[:12]),
-			Type:     "function",
-			Function: FunctionCall{Name: parsed.Name, Arguments: string(argsJSON)},
-		})
+func isPartialToolTagStart(s string) bool {
+	if len(s) == 0 || s[0] != '<' {
+		return false
 	}
-	return calls
+	// 可能是: <, <|, <|D, <|DS, <|DSM, <|DSML, <|DSML|, <|DSML|t, ...
+	// 或者: <t, <to, <too, <tool, ...
+	lower := strings.ToLower(s)
+	toolCallTag := "<tool_calls"
+	dsmlPrefixes := []string{"<", "<|", "<|d", "<|ds", "<|dsm", "<|dsml", "<|dsml|", "<|dsml|t", "<|dsml|to", "<|dsml|too", "<|dsml|tool", "<|dsml|tool_", "<|dsml|tool_c", "<|dsml|tool_ca", "<|dsml|tool_cal", "<|dsml|tool_call"}
+	
+	for _, prefix := range dsmlPrefixes {
+		if lower == prefix {
+			return true
+		}
+	}
+	for i := 1; i < len(toolCallTag) && i <= len(lower); i++ {
+		if lower == toolCallTag[:i] {
+			return true
+		}
+	}
+	return false
 }
 
 func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -531,7 +523,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 	hasContent := false
 	searchRefFilter := NewSearchRefFilter()
 	thinkingFilter := &ThinkingFilter{}
-	funcCallFilter := &functionCallStreamFilter{}
+	dsmlFilter := &dsmlStreamFilter{}
 	pendingSourcesMarkdown := ""
 	var toolCallTrackers []*toolCallTracker
 	var currentToolTracker *toolCallTracker
@@ -738,8 +730,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		}
 
 		if content != "" {
-			// 流式检测 <function_call> JSON 块
-			displayContent, newCalls := funcCallFilter.Process(content)
+			// 流式检测 DSML/XML 工具调用块
+			displayContent, newCalls := dsmlFilter.Process(content)
 			for _, tc := range newCalls {
 				hasContent = true
 				chunk := ChatCompletionChunk{
@@ -794,7 +786,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 	}
 
 	// Flush function call filter
-	if remaining := funcCallFilter.Flush(); remaining != "" {
+	if remaining := dsmlFilter.Flush(); remaining != "" {
 		remaining = searchRefFilter.Process(remaining) + searchRefFilter.Flush()
 		if remaining != "" {
 			hasContent = true
@@ -1004,14 +996,21 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 	fullReasoning := strings.Join(reasoningChunks, "")
 	fullReasoning = searchRefFilter.Process(fullReasoning) + searchRefFilter.Flush()
 
-	// 从文本中提取函数调用
+	// 从文本中提取 DSML 工具调用
 	var textToolCalls []ToolCall
 	if fullContent != "" {
-		textToolCalls = parseFunctionCallsFromText(fullContent)
+		parsed := ParseToolCalls(fullContent)
+		for i, pc := range parsed {
+			textToolCalls = append(textToolCalls, parsedToToolCall(pc, i))
+		}
 		if len(textToolCalls) > 0 {
-			// 移除 function_call 标签，保留纯净内容
-			re := regexp.MustCompile(`<function_call>[\s\S]*?</function_call>`)
+			// 移除 DSML/XML 工具调用块，保留纯净内容
+			re := regexp.MustCompile(`<\|?DSML\|?tool_calls[\s\S]*?</\|?DSML\|?tool_calls>`)
 			fullContent = strings.TrimSpace(re.ReplaceAllString(fullContent, ""))
+			if strings.Contains(fullContent, "<tool_calls") {
+				re2 := regexp.MustCompile(`<tool_calls[\s\S]*?</tool_calls>`)
+				fullContent = strings.TrimSpace(re2.ReplaceAllString(fullContent, ""))
+			}
 		}
 	}
 
