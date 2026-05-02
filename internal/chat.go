@@ -445,17 +445,20 @@ func isPartialToolTagStart(s string) bool {
 	if len(s) == 0 || s[0] != '<' {
 		return false
 	}
-	// 可能是: <, <|, <|D, <|DS, <|DSM, <|DSML, <|DSML|, <|DSML|t, ...
-	// 或者: <t, <to, <too, <tool, ...
 	lower := strings.ToLower(s)
-	toolCallTag := "<tool_calls"
-	dsmlPrefixes := []string{"<", "<|", "<|d", "<|ds", "<|dsm", "<|dsml", "<|dsml|", "<|dsml|t", "<|dsml|to", "<|dsml|too", "<|dsml|tool", "<|dsml|tool_", "<|dsml|tool_c", "<|dsml|tool_ca", "<|dsml|tool_cal", "<|dsml|tool_call"}
-	
-	for _, prefix := range dsmlPrefixes {
-		if lower == prefix {
+
+	// Check DSML-prefixed forms: <|dsml|tool_calls, <|dsml|invoke, <|dsml|parameter, </|dsml|...
+	if strings.HasPrefix(lower, "<|dsml|") {
+		return true
+	}
+	// Check plain XML tool tags: <tool_calls, <invoke, <parameter, </tool_calls, etc.
+	for _, tag := range []string{"<tool_calls", "</tool_calls", "<invoke", "</invoke", "<parameter", "</parameter"} {
+		if strings.HasPrefix(lower, tag) {
 			return true
 		}
 	}
+	// Check partial prefixes (e.g., <t, <to, <too, <tool)
+	toolCallTag := "<tool_calls"
 	for i := 1; i < len(toolCallTag) && i <= len(lower); i++ {
 		if lower == toolCallTag[:i] {
 			return true
