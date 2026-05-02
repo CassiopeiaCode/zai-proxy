@@ -61,7 +61,7 @@ func extractAllImageURLs(messages []Message) []string {
 	return allImageURLs
 }
 
-func makeUpstreamRequest(token string, messages []Message, model string) (*http.Response, string, error) {
+func makeUpstreamRequest(token string, messages []Message, model string, tools []Tool, toolChoice interface{}) (*http.Response, string, error) {
 	payload, err := DecodeJWTPayload(token)
 	if err != nil || payload == nil {
 		return nil, "", fmt.Errorf("invalid token")
@@ -113,6 +113,14 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 		},
 		"chat_id": chatID,
 		"id":      uuid.New().String(),
+	}
+
+	// 传递工具定义
+	if len(tools) > 0 {
+		body["tools"] = tools
+	}
+	if toolChoice != nil {
+		body["tool_choice"] = toolChoice
 	}
 
 	// 处理图片上传
@@ -252,6 +260,40 @@ func (f *ThinkingFilter) ExtractCompleteThinking(editContent string) string {
 	return content
 }
 
+// toolCallTracker 累积单个工具调用的流式增量
+type toolCallTracker struct {
+	id        string
+	name      string
+	arguments string
+	nameSent  bool
+	index     int
+}
+
+func (t *toolCallTracker) hasContent() bool {
+	return t.name != "" || t.arguments != ""
+}
+
+func (t *toolCallTracker) toToolCall() ToolCall {
+	return ToolCall{
+		Index:    t.index,
+		ID:       t.id,
+		Type:     "function",
+		Function: FunctionCall{Name: t.name, Arguments: t.arguments},
+	}
+}
+
+func (t *toolCallTracker) toDelta() ToolCall {
+	tc := t.toToolCall()
+	if t.nameSent {
+		tc.Function.Name = ""
+	}
+	return tc
+}
+
+func isJSONStart(s string) bool {
+	return len(s) > 0 && (s[0] == '{' || s[0] == '[')
+}
+
 func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if token == "" {
@@ -269,7 +311,7 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		req.Model = "GLM-4.6"
 	}
 
-	resp, modelName, err := makeUpstreamRequest(token, req.Messages, req.Model)
+	resp, modelName, err := makeUpstreamRequest(token, req.Messages, req.Model, req.Tools, req.ToolChoice)
 	if err != nil {
 		LogError("Upstream request failed: %v", err)
 		http.Error(w, "Upstream error", http.StatusBadGateway)
@@ -314,6 +356,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 	searchRefFilter := NewSearchRefFilter()
 	thinkingFilter := &ThinkingFilter{}
 	pendingSourcesMarkdown := ""
+	var toolCallTrackers []*toolCallTracker
+	var currentToolTracker *toolCallTracker
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -391,6 +435,45 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		}
 		// 跳过搜索工具调用
 		if upstream.Data.EditContent != "" && IsSearchToolCall(upstream.Data.EditContent, upstream.Data.Phase) {
+			continue
+		}
+
+		// 处理函数调用（tool_call + delta_content，非搜索类）
+		if upstream.Data.Phase == "tool_call" && upstream.Data.DeltaContent != "" {
+			deltaContent := upstream.Data.DeltaContent
+			if currentToolTracker == nil || !isJSONStart(deltaContent) {
+				// 新的工具调用
+				if currentToolTracker != nil && currentToolTracker.hasContent() {
+					toolCallTrackers = append(toolCallTrackers, currentToolTracker)
+				}
+				currentToolTracker = &toolCallTracker{
+					id:    fmt.Sprintf("call_%s", uuid.New().String()[:12]),
+					name:  strings.TrimSpace(deltaContent),
+					index: len(toolCallTrackers),
+				}
+			}
+			if currentToolTracker != nil {
+				if isJSONStart(deltaContent) {
+					currentToolTracker.arguments += deltaContent
+				}
+				hasContent = true
+				tc := currentToolTracker.toDelta()
+				currentToolTracker.nameSent = true
+				chunk := ChatCompletionChunk{
+					ID:      completionID,
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   modelName,
+					Choices: []Choice{{
+						Index:        0,
+						Delta:        Delta{ToolCalls: []ToolCall{tc}},
+						FinishReason: nil,
+					}},
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
 			continue
 		}
 
@@ -531,6 +614,36 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		LogError("Stream response 200 but no content received")
 	}
 
+	// 最终化当前工具调用
+	if currentToolTracker != nil && currentToolTracker.hasContent() {
+		toolCallTrackers = append(toolCallTrackers, currentToolTracker)
+	}
+
+	// 如果有工具调用，先发送完整的工具调用块
+	if len(toolCallTrackers) > 0 {
+		var finalToolCalls []ToolCall
+		for _, t := range toolCallTrackers {
+			finalToolCalls = append(finalToolCalls, t.toToolCall())
+		}
+		toolCallReason := "tool_calls"
+		finalChunk := ChatCompletionChunk{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   modelName,
+			Choices: []Choice{{
+				Index:        0,
+				Delta:        Delta{ToolCalls: finalToolCalls},
+				FinishReason: &toolCallReason,
+			}},
+		}
+		data, _ := json.Marshal(finalChunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
 	// Final chunk
 	stopReason := "stop"
 	finalChunk := ChatCompletionChunk{
@@ -560,6 +673,8 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 	searchRefFilter := NewSearchRefFilter()
 	hasThinking := false
 	pendingSourcesMarkdown := ""
+	var toolCallTrackers []*toolCallTracker
+	var currentToolTracker *toolCallTracker
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -628,9 +743,34 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 			content = upstream.Data.EditContent
 		}
 
-		if content != "" {
+	if content != "" {
 			chunks = append(chunks, content)
 		}
+
+		// 处理函数调用增量（tool_call + delta_content）
+		if upstream.Data.Phase == "tool_call" && upstream.Data.DeltaContent != "" {
+			deltaContent := upstream.Data.DeltaContent
+			if currentToolTracker == nil || !isJSONStart(deltaContent) {
+				if currentToolTracker != nil && currentToolTracker.hasContent() {
+					toolCallTrackers = append(toolCallTrackers, currentToolTracker)
+				}
+				currentToolTracker = &toolCallTracker{
+					id:    fmt.Sprintf("call_%s", uuid.New().String()[:12]),
+					name:  strings.TrimSpace(deltaContent),
+					index: len(toolCallTrackers),
+				}
+			}
+			if currentToolTracker != nil && isJSONStart(deltaContent) {
+				currentToolTracker.arguments += deltaContent
+			}
+			if currentToolTracker != nil {
+				currentToolTracker.nameSent = true
+			}
+		}
+	}
+
+	if currentToolTracker != nil && currentToolTracker.hasContent() {
+		toolCallTrackers = append(toolCallTrackers, currentToolTracker)
 	}
 
 	fullContent := strings.Join(chunks, "")
@@ -638,11 +778,19 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 	fullReasoning := strings.Join(reasoningChunks, "")
 	fullReasoning = searchRefFilter.Process(fullReasoning) + searchRefFilter.Flush()
 
-	if fullContent == "" {
+	if fullContent == "" && len(toolCallTrackers) == 0 {
 		LogError("Non-stream response 200 but no content received")
 	}
 
-	stopReason := "stop"
+	finishReason := "stop"
+	var toolCalls []ToolCall
+	if len(toolCallTrackers) > 0 {
+		finishReason = "tool_calls"
+		for _, t := range toolCallTrackers {
+			toolCalls = append(toolCalls, t.toToolCall())
+		}
+	}
+
 	response := ChatCompletionResponse{
 		ID:      completionID,
 		Object:  "chat.completion",
@@ -654,8 +802,9 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 				Role:             "assistant",
 				Content:          fullContent,
 				ReasoningContent: fullReasoning,
+				ToolCalls:        toolCalls,
 			},
-			FinishReason: &stopReason,
+			FinishReason: &finishReason,
 		}},
 	}
 

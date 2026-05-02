@@ -121,9 +121,34 @@ func (m *Message) ToUpstreamMessage() map[string]string {
 }
 
 type ChatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
+	Model      string       `json:"model"`
+	Messages   []Message    `json:"messages"`
+	Stream     bool         `json:"stream"`
+	Tools      []Tool       `json:"tools,omitempty"`
+	ToolChoice interface{}  `json:"tool_choice,omitempty"`
+}
+
+type Tool struct {
+	Type     string       `json:"type"`
+	Function FunctionDef  `json:"function"`
+}
+
+type FunctionDef struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description,omitempty"`
+	Parameters  interface{} `json:"parameters,omitempty"`
+}
+
+type ToolCall struct {
+	Index    int          `json:"index"`
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function FunctionCall `json:"function"`
+}
+
+type FunctionCall struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments"`
 }
 
 type ChatCompletionChunk struct {
@@ -142,14 +167,16 @@ type Choice struct {
 }
 
 type Delta struct {
-	Content          string `json:"content,omitempty"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type MessageResp struct {
-	Role             string `json:"role"`
-	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type ChatCompletionResponse struct {
