@@ -69,52 +69,49 @@ func injectToolPrompt(messages []map[string]string, tools []Tool, toolChoice int
 	}
 
 	var sb strings.Builder
-	sb.WriteString("# Tools\n\n")
-	sb.WriteString("You have access to the following functions. To call a function, output a JSON block wrapped in `<function_call>` tags:\n\n")
-	sb.WriteString("```\n")
+	sb.WriteString("你只能通过调用函数来回答。你必须输出一个 JSON 代码块，格式如下：\n\n")
 	sb.WriteString("<function_call>\n")
-	sb.WriteString("{\"name\": \"function_name\", \"arguments\": {\"param\": \"value\"}}\n")
-	sb.WriteString("</function_call>\n")
-	sb.WriteString("```\n\n")
+	sb.WriteString("{\"name\": \"函数名\", \"arguments\": {\"参数名\": \"参数值\"}}\n")
+	sb.WriteString("</function_call>\n\n")
+	sb.WriteString("严格遵循以下规则：\n")
+	sb.WriteString("1. 不要输出任何解释、问候语或额外文字\n")
+	sb.WriteString("2. 不要用 markdown 代码块包裹 <function_call>\n")
+	sb.WriteString("3. 只能输出一个 <function_call> 块\n\n")
+	sb.WriteString("可用的函数：\n\n")
 
 	for _, t := range tools {
 		fn := t.Function
-		sb.WriteString(fmt.Sprintf("## %s\n\n", fn.Name))
+		sb.WriteString(fmt.Sprintf("### %s\n", fn.Name))
 		if fn.Description != "" {
-			sb.WriteString(fmt.Sprintf("%s\n\n", fn.Description))
+			sb.WriteString(fmt.Sprintf("描述: %s\n", fn.Description))
 		}
 		if fn.Parameters != nil {
 			paramsJSON, err := json.Marshal(fn.Parameters)
 			if err == nil {
-				sb.WriteString(fmt.Sprintf("Parameters: `%s`\n\n", string(paramsJSON)))
+				sb.WriteString(fmt.Sprintf("参数: %s\n", string(paramsJSON)))
 			}
 		}
+		sb.WriteString("\n")
 	}
 
 	// 检查 tool_choice 是否强制调用
 	if tc, ok := toolChoice.(string); ok && tc == "required" {
-		sb.WriteString("IMPORTANT: You MUST call one of the available functions. Do not respond with regular text.\n")
+		sb.WriteString("【重要】你必须调用上述函数之一，禁止输出普通文本回复。\n")
 	}
 	if tc, ok := toolChoice.(map[string]interface{}); ok {
 		if fnObj, ok := tc["function"]; ok {
 			if fnMap, ok := fnObj.(map[string]interface{}); ok {
 				if name, ok := fnMap["name"].(string); ok {
-					sb.WriteString(fmt.Sprintf("IMPORTANT: You MUST call the function '%s'. Do not respond with regular text.\n", name))
+					sb.WriteString(fmt.Sprintf("【重要】你必须调用函数 '%s'，禁止调用其他函数或输出文本。\n", name))
 				}
 			}
 		}
 	}
 
-	systemMsg := map[string]string{
-		"role":    "system",
-		"content": sb.String(),
-	}
-
-	// 插入到最前面（如果有现有 system 消息则合并）
-	if len(messages) > 0 && messages[0]["role"] == "system" {
-		messages[0]["content"] = systemMsg["content"] + "\n\n" + messages[0]["content"]
-	} else {
-		messages = append([]map[string]string{systemMsg}, messages...)
+	// 拼接到最后一条用户消息末尾（比 system 消息对 GLM 更有效）
+	if len(messages) > 0 {
+		lastIdx := len(messages) - 1
+		messages[lastIdx]["content"] = messages[lastIdx]["content"] + "\n\n" + sb.String()
 	}
 
 	return messages
