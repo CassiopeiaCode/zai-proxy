@@ -79,8 +79,8 @@ func makeUpstreamRequest(token string, messages []Message, model string, tools [
 
 	signature := GenerateSignature(userID, requestID, latestUserContent, timestamp)
 
-	url := fmt.Sprintf("https://chat.z.ai/api/v2/chat/completions?timestamp=%d&requestId=%s&user_id=%s&version=0.0.1&platform=web&token=%s&current_url=%s&pathname=%s&signature_timestamp=%d",
-		timestamp, requestID, userID, token,
+	url := fmt.Sprintf("https://chat.z.ai/api/v2/chat/completions?timestamp=%d&requestId=%s&user_id=%s&version=%s&platform=web&token=%s&current_url=%s&pathname=%s&signature_timestamp=%d",
+		timestamp, requestID, userID, GetVersionNumber(), token,
 		fmt.Sprintf("https://chat.z.ai/c/%s", chatID),
 		fmt.Sprintf("/c/%s", chatID),
 		timestamp)

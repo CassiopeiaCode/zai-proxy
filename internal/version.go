@@ -3,6 +3,7 @@ package internal
 import (
 	"io"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,6 +17,14 @@ func GetFeVersion() string {
 	versionLock.RLock()
 	defer versionLock.RUnlock()
 	return feVersion
+}
+
+func GetVersionNumber() string {
+	v := GetFeVersion()
+	if s := strings.TrimPrefix(v, "prod-fe-"); s != v {
+		return s
+	}
+	return "0.0.1"
 }
 
 func fetchFeVersion() {
