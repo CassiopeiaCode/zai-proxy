@@ -167,6 +167,13 @@ func makeUpstreamRequest(token string, messages []Message, model string, tools [
 		upstreamMessages = append(upstreamMessages, msg.ToUpstreamMessage())
 	}
 
+	// 将 tools 注入到系统提示词中（在构造 body 之前）
+	if len(tools) > 0 {
+		upstreamMessages = injectToolPrompt(upstreamMessages, tools, toolChoice)
+		latestUserContent = extractLatestUpstreamContent(upstreamMessages)
+		signature = GenerateSignature(userID, requestID, latestUserContent, timestamp)
+	}
+
 	body := map[string]interface{}{
 		"stream":           true,
 		"model":            targetModel,
@@ -182,15 +189,6 @@ func makeUpstreamRequest(token string, messages []Message, model string, tools [
 		},
 		"chat_id": chatID,
 		"id":      uuid.New().String(),
-	}
-
-	// 将 tools 注入到系统提示词中（不通过 API 参数传递）
-	if len(tools) > 0 {
-		upstreamMessages = injectToolPrompt(upstreamMessages, tools, toolChoice)
-		// 重新签名（内容已变）
-		latestUserContent = extractLatestUpstreamContent(upstreamMessages)
-		signature = GenerateSignature(userID, requestID, latestUserContent, timestamp)
-		body["signature_prompt"] = latestUserContent
 	}
 
 	// 处理图片上传
