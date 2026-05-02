@@ -365,6 +365,80 @@ func isJSONStart(s string) bool {
 	return len(s) > 0 && (s[0] == '{' || s[0] == '[')
 }
 
+// functionCallStreamFilter 流式检测 <function_call> JSON 块
+type functionCallStreamFilter struct {
+	buffer string
+	inCall bool
+}
+
+func (f *functionCallStreamFilter) Process(chunk string) (text string, calls []ToolCall) {
+	f.buffer += chunk
+
+	startTag := "<function_call>"
+	endTag := "</function_call>"
+
+	var textParts []string
+	remaining := f.buffer
+
+	for {
+		if !f.inCall {
+			idx := strings.Index(remaining, startTag)
+			if idx == -1 {
+				safe, hold := splitSafeForPartialTag(remaining, startTag)
+				textParts = append(textParts, safe)
+				remaining = hold
+				break
+			}
+			textParts = append(textParts, remaining[:idx])
+			remaining = remaining[idx+len(startTag):]
+			f.inCall = true
+		}
+
+		if f.inCall {
+			idx := strings.Index(remaining, endTag)
+			if idx == -1 {
+				break
+			}
+			jsonStr := strings.TrimSpace(remaining[:idx])
+			remaining = remaining[idx+len(endTag):]
+			f.inCall = false
+
+			var parsed struct {
+				Name      string      `json:"name"`
+				Arguments interface{} `json:"arguments"`
+			}
+			if err := json.Unmarshal([]byte(jsonStr), &parsed); err == nil {
+				argsJSON, _ := json.Marshal(parsed.Arguments)
+				calls = append(calls, ToolCall{
+					Index:    len(calls),
+					ID:       fmt.Sprintf("call_%s", uuid.New().String()[:12]),
+					Type:     "function",
+					Function: FunctionCall{Name: parsed.Name, Arguments: string(argsJSON)},
+				})
+			}
+		}
+	}
+
+	f.buffer = remaining
+	return strings.Join(textParts, ""), calls
+}
+
+func (f *functionCallStreamFilter) Flush() string {
+	result := f.buffer
+	f.buffer = ""
+	f.inCall = false
+	return result
+}
+
+func splitSafeForPartialTag(s, tag string) (safe, hold string) {
+	for i := 1; i < len(tag) && i <= len(s); i++ {
+		if strings.HasSuffix(s, tag[:i]) {
+			return s[:len(s)-i], s[len(s)-i:]
+		}
+	}
+	return s, ""
+}
+
 // parseFunctionCallsFromText 从文本中提取 <function_call> 块
 func parseFunctionCallsFromText(text string) []ToolCall {
 	var calls []ToolCall
@@ -462,9 +536,11 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 	hasContent := false
 	searchRefFilter := NewSearchRefFilter()
 	thinkingFilter := &ThinkingFilter{}
+	funcCallFilter := &functionCallStreamFilter{}
 	pendingSourcesMarkdown := ""
 	var toolCallTrackers []*toolCallTracker
 	var currentToolTracker *toolCallTracker
+	var textToolCalls []ToolCall
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -666,6 +742,30 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			flusher.Flush()
 		}
 
+		if content != "" {
+			// 流式检测 <function_call> JSON 块
+			displayContent, newCalls := funcCallFilter.Process(content)
+			for _, tc := range newCalls {
+				hasContent = true
+				chunk := ChatCompletionChunk{
+					ID:      completionID,
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   modelName,
+					Choices: []Choice{{
+						Index:        0,
+						Delta:        Delta{ToolCalls: []ToolCall{tc}},
+						FinishReason: nil,
+					}},
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+			textToolCalls = append(textToolCalls, newCalls...)
+			content = displayContent
+		}
+
 		if content == "" {
 			continue
 		}
@@ -698,6 +798,28 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		LogError("[Upstream] scanner error: %v", err)
 	}
 
+	// Flush function call filter
+	if remaining := funcCallFilter.Flush(); remaining != "" {
+		remaining = searchRefFilter.Process(remaining) + searchRefFilter.Flush()
+		if remaining != "" {
+			hasContent = true
+			chunk := ChatCompletionChunk{
+				ID:      completionID,
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   modelName,
+				Choices: []Choice{{
+					Index:        0,
+					Delta:        Delta{Content: remaining},
+					FinishReason: nil,
+				}},
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+
 	// 输出过滤器中剩余的内容（非引用标记的部分）
 	if remaining := searchRefFilter.Flush(); remaining != "" {
 		hasContent = true
@@ -717,7 +839,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		flusher.Flush()
 	}
 
-	if !hasContent {
+	if !hasContent && len(textToolCalls) == 0 {
 		LogError("Stream response 200 but no content received")
 	}
 
@@ -726,12 +848,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		toolCallTrackers = append(toolCallTrackers, currentToolTracker)
 	}
 
-	// 如果有工具调用，先发送完整的工具调用块
-	if len(toolCallTrackers) > 0 {
-		var finalToolCalls []ToolCall
-		for _, t := range toolCallTrackers {
-			finalToolCalls = append(finalToolCalls, t.toToolCall())
-		}
+	// 合并 tool_call phase 的工具调用和文本中的函数调用
+	allToolCalls := textToolCalls
+	for _, t := range toolCallTrackers {
+		allToolCalls = append(allToolCalls, t.toToolCall())
+	}
+
+	// 如果有工具调用，发送最终的 tool_calls 块
+	if len(allToolCalls) > 0 {
 		toolCallReason := "tool_calls"
 		finalChunk := ChatCompletionChunk{
 			ID:      completionID,
@@ -740,7 +864,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			Model:   modelName,
 			Choices: []Choice{{
 				Index:        0,
-				Delta:        Delta{ToolCalls: finalToolCalls},
+				Delta:        Delta{ToolCalls: allToolCalls},
 				FinishReason: &toolCallReason,
 			}},
 		}
@@ -902,14 +1026,13 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 
 	finishReason := "stop"
 	var toolCalls []ToolCall
-	if len(toolCallTrackers) > 0 {
+	// 合并 tool_call phase 的工具调用和文本中的函数调用
+	toolCalls = append(toolCalls, textToolCalls...)
+	for _, t := range toolCallTrackers {
+		toolCalls = append(toolCalls, t.toToolCall())
+	}
+	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
-		for _, t := range toolCallTrackers {
-			toolCalls = append(toolCalls, t.toToolCall())
-		}
-	} else if len(textToolCalls) > 0 {
-		finishReason = "tool_calls"
-		toolCalls = textToolCalls
 	}
 
 	response := ChatCompletionResponse{
