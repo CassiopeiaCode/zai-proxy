@@ -969,7 +969,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		allToolCalls = append(allToolCalls, t.toToolCall())
 	}
 
-	// 如果有工具调用，发送最终的 tool_calls 块
+	// 如果有工具调用，发送 tool_calls 的 finish_reason
+	// 工具调用 delta 已在流式过程中逐个发出，这里只发结束标记
 	if len(allToolCalls) > 0 {
 		toolCallReason := "tool_calls"
 		finalChunk := ChatCompletionChunk{
@@ -979,7 +980,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			Model:   modelName,
 			Choices: []Choice{{
 				Index:        0,
-				Delta:        Delta{ToolCalls: allToolCalls},
+				Delta:        Delta{},
 				FinishReason: &toolCallReason,
 			}},
 		}
